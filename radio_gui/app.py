@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import audioop
 import logging
 import queue
 import threading
@@ -13,6 +12,8 @@ from tkinter import messagebox
 from tkinter import ttk
 from tkinter.scrolledtext import ScrolledText
 from typing import Dict, Optional
+
+import numpy as np
 
 try:
     from serial.tools import list_ports
@@ -515,11 +516,12 @@ class RadioApp(tk.Tk):
 
     def _handle_mic_chunk(self, data: bytes) -> None:
         if self._vox_enabled_flag:
-            try:
-                level = audioop.rms(data, 2) / 32768.0
-            except (audioop.error, ZeroDivisionError):
+            samples = np.frombuffer(data, dtype=np.int16)
+            if samples.size:
+                rms = float(np.sqrt(np.mean(samples.astype(np.float32) ** 2)))
+                level = max(0.0, min(rms / 32768.0, 1.0))
+            else:
                 level = 0.0
-            level = max(0.0, min(level, 1.0))
             try:
                 self._vox_level_queue.put_nowait(level)
             except queue.Full:
