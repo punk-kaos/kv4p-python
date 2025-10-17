@@ -6,6 +6,7 @@ This directory holds the pure-Python tooling that talks to the KV4P-HT radio fir
 
 - `kv4p_python/` – production library with the `RadioController` class and protocol helpers.
 - `radio_gui/` – desktop GUI that exercises the controller, audio capture/playback, and PTT workflow.
+- `kiss_tnc/` – headless KISS TCP TNC built on top of the KV4P radio controller.
 - `tests/` – `unittest`-based regression checks for the protocol layer.
 - `requirements.txt` – Python dependencies, including OPUS bindings (`opuslib`) used for 48 kHz audio.
 
@@ -53,6 +54,16 @@ The requirements list includes `pyserial`, `sounddevice`, `numpy`, and `opuslib`
    ```
 
    Select the port, open the connection, and use the “Set PTT Key” button to bind a keyboard shortcut. Hold the key to transmit; release to return to RX.
+
+### Headless KISS TNC
+
+Launch the TCP KISS server (defaults to `127.0.0.1:8001`):
+
+```bash
+python -m kiss_tnc --port /dev/tty.usbserial-xxxx --tx 144.390 --squelch 0 --log-level DEBUG
+```
+
+Attach a KISS-aware client (e.g., `direwolf -lp 8001` or any APRS application). The modem implements 1200 baud AFSK with simple demodulation suited for strong signals.
 
 ### Library Example
 

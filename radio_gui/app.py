@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import audioop
 import logging
 import queue
 import threading
+import time
 import tkinter as tk
 from tkinter import messagebox
 from tkinter import ttk
@@ -80,6 +82,18 @@ class RadioApp(tk.Tk):
         self.waiting_for_ptt_key = False
         self.ptt_key = "space"
         self.status_queue: "queue.Queue[str]" = queue.Queue()
+        self.vox_enabled = tk.BooleanVar(value=False)
+        self.vox_threshold = tk.DoubleVar(value=35.0)
+        self.vox_hold = tk.DoubleVar(value=600.0)
+        self.vox_level = tk.DoubleVar(value=0.0)
+        self._vox_enabled_flag = False
+        self._vox_threshold_value = 0.35
+        self._vox_hold_seconds = 0.6
+        self._vox_active = False
+        self._vox_last_activity = 0.0
+        self._vox_level_queue: "queue.Queue[float]" = queue.Queue(maxsize=32)
+        self._vox_smoothed_level = 0.0
+        self._current_tx_reason = "none"
         self._tx_queue: "queue.Queue[bytes]" = queue.Queue(maxsize=64)
         self._tx_thread: Optional[threading.Thread] = None
         self._tx_stop = threading.Event()
@@ -94,6 +108,7 @@ class RadioApp(tk.Tk):
         self.refresh_audio_devices()
         self.toggle_controls(False)
         self.after(500, self._drain_status_queue)
+        self.after(50, self._process_vox_levels)
 
     # ------------------------------------------------------------------
     # UI construction
@@ -214,8 +229,47 @@ class RadioApp(tk.Tk):
         )
         playback_scale.grid(row=1, column=3, sticky="ew", padx=5, pady=5)
 
+        self.vox_enabled_check = ttk.Checkbutton(
+            audio_frame,
+            text="Enable VOX",
+            variable=self.vox_enabled,
+            command=self._on_vox_toggle,
+        )
+        self.vox_enabled_check.grid(row=2, column=0, sticky="w", padx=5, pady=5)
+
+        ttk.Label(audio_frame, text="Threshold:").grid(row=2, column=1, sticky="w", padx=5, pady=5)
+        self.vox_threshold_scale = ttk.Scale(
+            audio_frame,
+            from_=0,
+            to=100,
+            variable=self.vox_threshold,
+            command=lambda _: self._on_vox_threshold_change(),
+        )
+        self.vox_threshold_scale.grid(row=2, column=2, sticky="ew", padx=5, pady=5)
+        self.vox_threshold_value_label = ttk.Label(audio_frame, text="0%")
+        self.vox_threshold_value_label.grid(row=2, column=3, sticky="w", padx=5, pady=5)
+
+        ttk.Label(audio_frame, text="Hold (ms):").grid(row=3, column=0, sticky="w", padx=5, pady=5)
+        self.vox_hold_scale = ttk.Scale(
+            audio_frame,
+            from_=100,
+            to=2000,
+            variable=self.vox_hold,
+            command=lambda _: self._on_vox_hold_change(),
+        )
+        self.vox_hold_scale.grid(row=3, column=1, sticky="ew", padx=5, pady=5)
+        self.vox_hold_value_label = ttk.Label(audio_frame, text="0 ms")
+        self.vox_hold_value_label.grid(row=3, column=2, sticky="w", padx=5, pady=5)
+
+        self.vox_level_bar = ttk.Progressbar(
+            audio_frame,
+            maximum=100,
+            variable=self.vox_level,
+        )
+        self.vox_level_bar.grid(row=3, column=3, sticky="ew", padx=5, pady=5)
+
         self.ptt_button = ttk.Button(audio_frame, text="Set PTT Key", command=self.request_ptt_key)
-        self.ptt_button.grid(row=2, column=0, columnspan=4, padx=5, pady=5, sticky="ew")
+        self.ptt_button.grid(row=4, column=0, columnspan=4, padx=5, pady=5, sticky="ew")
 
         status_frame = ttk.LabelFrame(self, text="Status")
         status_frame.grid(row=5, column=0, sticky="nsew", padx=10, pady=(5, 10))
@@ -224,6 +278,9 @@ class RadioApp(tk.Tk):
 
         self.status_text = ScrolledText(status_frame, height=12, state="disabled")
         self.status_text.grid(row=0, column=0, sticky="nsew")
+
+        self._on_vox_threshold_change()
+        self._on_vox_hold_change()
 
     # ------------------------------------------------------------------
     # Device discovery
@@ -297,6 +354,13 @@ class RadioApp(tk.Tk):
             self.controller.initialize()
             self.controller.start_rx_mode()
             self.audio_engine.start_playback()
+            if self._vox_enabled_flag:
+                try:
+                    self.audio_engine.start_recording(self._handle_mic_chunk)
+                except Exception as exc:
+                    self._vox_enabled_flag = False
+                    self.vox_enabled.set(False)
+                    self.append_status(f"VOX monitor failed to start: {exc}")
             self.append_status(f"Connection opened on {port_name}.")
             self.toggle_controls(True)
             self.update_status_indicator(False)
@@ -317,6 +381,9 @@ class RadioApp(tk.Tk):
         self.audio_engine.stop_playback()
         self.toggle_controls(False)
         self.update_status_indicator(False)
+        self._vox_active = False
+        self._vox_last_activity = 0.0
+        self.vox_level.set(0.0)
         self.append_status("Connection closed.")
 
     def tune_frequency(self) -> None:
@@ -363,7 +430,7 @@ class RadioApp(tk.Tk):
     # ------------------------------------------------------------------
     # Transmission control
     # ------------------------------------------------------------------
-    def start_transmission(self) -> None:
+    def start_transmission(self, *, reason: str = "ptt") -> None:
         if self._ptt_release_timer is not None:
             self.after_cancel(self._ptt_release_timer)
             self._ptt_release_timer = None
@@ -372,9 +439,11 @@ class RadioApp(tk.Tk):
             return
         if self.is_transmitting:
             return
+        self._current_tx_reason = reason
         try:
             self.controller.start_tx_mode()
         except RadioControllerError as exc:
+            self._current_tx_reason = "none"
             self.append_status(f"Failed to enter TX: {exc}")
             return
 
@@ -388,7 +457,7 @@ class RadioApp(tk.Tk):
             except queue.Empty:
                 break
         try:
-            self.audio_engine.start_recording(self._handle_tx_chunk)
+            self.audio_engine.start_recording(self._handle_mic_chunk)
         except Exception as exc:
             self._tx_stop.set()
             self.append_status(f"Audio capture failed: {exc}")
@@ -398,10 +467,19 @@ class RadioApp(tk.Tk):
             except RadioControllerError:
                 pass
             self.audio_engine.start_playback()
+            self._current_tx_reason = "none"
             return
         self.is_transmitting = True
+        if reason == "vox":
+            self._vox_active = True
+            self._vox_last_activity = time.monotonic()
+        else:
+            self._vox_active = False
         self.update_status_indicator(True)
-        self.append_status("Transmission started (hold PTT key to transmit).")
+        if reason == "vox":
+            self.append_status("Transmission started (VOX active).")
+        else:
+            self.append_status("Transmission started (hold PTT key to transmit).")
 
     def stop_transmission(self) -> None:
         if not self.is_transmitting:
@@ -409,7 +487,8 @@ class RadioApp(tk.Tk):
         if self._ptt_release_timer is not None:
             self.after_cancel(self._ptt_release_timer)
             self._ptt_release_timer = None
-        self.audio_engine.stop_recording()
+        if not self._vox_enabled_flag:
+            self.audio_engine.stop_recording()
         self._tx_stop.set()
         while not self._tx_queue.empty():
             try:
@@ -428,8 +507,25 @@ class RadioApp(tk.Tk):
                 self.append_status(f"Failed to exit TX cleanly: {exc}")
         self.audio_engine.start_playback()
         self.is_transmitting = False
+        if self._current_tx_reason == "vox":
+            self._vox_active = False
+        self._current_tx_reason = "none"
         self.update_status_indicator(False)
         self.append_status("Transmission stopped.")
+
+    def _handle_mic_chunk(self, data: bytes) -> None:
+        if self._vox_enabled_flag:
+            try:
+                level = audioop.rms(data, 2) / 32768.0
+            except (audioop.error, ZeroDivisionError):
+                level = 0.0
+            level = max(0.0, min(level, 1.0))
+            try:
+                self._vox_level_queue.put_nowait(level)
+            except queue.Full:
+                pass
+        if self.is_transmitting:
+            self._handle_tx_chunk(data)
 
     def _handle_tx_chunk(self, data: bytes) -> None:
         try:
@@ -450,6 +546,95 @@ class RadioApp(tk.Tk):
                 controller.send_audio_data(chunk)
             except Exception as exc:  # pragma: no cover - hardware specific
                 self.append_status(f"Audio send error: {exc}")
+
+    # ------------------------------------------------------------------
+    # VOX control
+    # ------------------------------------------------------------------
+    def _process_vox_levels(self) -> None:
+        smoothed = self._vox_smoothed_level
+        updated = False
+        while True:
+            try:
+                level = self._vox_level_queue.get_nowait()
+            except queue.Empty:
+                break
+            updated = True
+            smoothed = (0.6 * smoothed) + (0.4 * level)
+            self._evaluate_vox(level)
+        if not updated:
+            smoothed *= 0.85
+        self._vox_smoothed_level = max(0.0, min(smoothed, 1.0))
+        self.vox_level.set(self._vox_smoothed_level * 100.0)
+        self.after(40, self._process_vox_levels)
+
+    def _evaluate_vox(self, level: float) -> None:
+        if not self._vox_enabled_flag:
+            return
+        if self.controller is None:
+            return
+        now = time.monotonic()
+        threshold = self._vox_threshold_value
+        if threshold <= 0.0:
+            threshold = 0.0
+
+        if level >= threshold:
+            if self.is_transmitting and self._current_tx_reason != "vox":
+                return
+            self._vox_last_activity = now
+            if not self.is_transmitting:
+                self.start_transmission(reason="vox")
+                if not self.is_transmitting:
+                    self._vox_active = False
+                    return
+            else:
+                self._vox_active = self._current_tx_reason == "vox"
+            return
+
+        if self._vox_active:
+            hold = self._vox_hold_seconds
+            if hold <= 0.0:
+                hold = 0.0
+            if (now - self._vox_last_activity) >= hold:
+                self._vox_active = False
+                if self.is_transmitting and self._current_tx_reason == "vox":
+                    self.stop_transmission()
+
+    def _on_vox_toggle(self) -> None:
+        enabled = bool(self.vox_enabled.get())
+        self._vox_enabled_flag = enabled
+        if enabled:
+            self._vox_active = False
+            self._vox_last_activity = 0.0
+            try:
+                self.audio_engine.start_recording(self._handle_mic_chunk)
+            except Exception as exc:
+                self._vox_enabled_flag = False
+                self.vox_enabled.set(False)
+                self.append_status(f"Failed to enable VOX: {exc}")
+                return
+            self.append_status("VOX enabled.")
+        else:
+            self._vox_active = False
+            if self.is_transmitting and self._current_tx_reason == "vox":
+                self.stop_transmission()
+            elif not self.is_transmitting:
+                self.audio_engine.stop_recording()
+            self.vox_level.set(0.0)
+            self.append_status("VOX disabled.")
+
+    def _on_vox_threshold_change(self) -> None:
+        value = float(self.vox_threshold.get())
+        value = max(0.0, min(100.0, value))
+        self._vox_threshold_value = value / 100.0
+        if hasattr(self, "vox_threshold_value_label"):
+            self.vox_threshold_value_label.configure(text=f"{value:.0f}%")
+
+    def _on_vox_hold_change(self) -> None:
+        value = float(self.vox_hold.get())
+        value = max(100.0, min(2000.0, value))
+        self._vox_hold_seconds = value / 1000.0
+        if hasattr(self, "vox_hold_value_label"):
+            self.vox_hold_value_label.configure(text=f"{int(value)} ms")
 
     # ------------------------------------------------------------------
     # Event handlers
@@ -544,6 +729,9 @@ class RadioApp(tk.Tk):
             self.ptt_button,
             self.tune_button,
             self.filter_button,
+            self.vox_enabled_check,
+            self.vox_threshold_scale,
+            self.vox_hold_scale,
         ]:
             widget.state([state])
         if enabled:

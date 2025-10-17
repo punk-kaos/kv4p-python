@@ -144,10 +144,29 @@ class RadioController:
         self._window_size: Optional[int] = None
         self._features: int = 0
         self._opus_frame_size = int(self.AUDIO_SAMPLE_RATE * self.OPUS_FRAME_DURATION_MS / 1000)
+        # RX path provides decompressed PCM; TX path tries to encode OPUS but can fallback when unavailable.
         self._opus_frame_bytes = self._opus_frame_size * 2
+        self._opus_application: Optional[str] = None
         if OPUS_AVAILABLE and OpusEncoder is not None and OpusDecoder is not None:
-            self._opus_encoder = OpusEncoder(self.AUDIO_SAMPLE_RATE, 1, APPLICATION_AUDIO)  # type: ignore[arg-type]
-            self._opus_decoder = OpusDecoder(self.AUDIO_SAMPLE_RATE, 1)  # type: ignore[misc]
+            encoder: Optional[object] = None
+            try:
+                encoder = OpusEncoder(self.AUDIO_SAMPLE_RATE, 1, "restricted_lowdelay")  # type: ignore[arg-type]
+                self._opus_application = "restricted_lowdelay"
+            except Exception as exc:
+                LOGGER.debug("Restricted low-delay OPUS profile unavailable: %s; falling back to audio profile.", exc)
+                try:
+                    encoder = OpusEncoder(self.AUDIO_SAMPLE_RATE, 1, APPLICATION_AUDIO)  # type: ignore[arg-type]
+                    self._opus_application = "audio"
+                except Exception as inner_exc:  # pragma: no cover - runtime dependency
+                    LOGGER.warning("Failed to initialize OPUS encoder: %s", inner_exc)
+                    self._opus_application = None
+            self._opus_encoder = encoder  # type: ignore[assignment]
+            try:
+                self._opus_decoder = OpusDecoder(self.AUDIO_SAMPLE_RATE, 1)  # type: ignore[misc]
+            except Exception as exc:  # pragma: no cover - runtime dependency
+                LOGGER.warning("Failed to initialize OPUS decoder: %s", exc)
+                self._opus_decoder = None  # type: ignore[assignment]
+            self._configure_opus_codec()
         else:
             self._opus_encoder = None
             self._opus_decoder = None
@@ -158,6 +177,54 @@ class RadioController:
         self._frame_overhead = len(self.COMMAND_DELIMITER) + 3
         self._window_available: Optional[int] = None
         self._window_condition = threading.Condition()
+
+    # ------------------------------------------------------------------
+    def _configure_opus_codec(self) -> None:
+        """Apply OPUS tuning via low-level controls to preserve tone fidelity."""
+        if not OPUS_AVAILABLE:
+            return
+
+        try:
+            import opuslib  # type: ignore
+            from opuslib.api import ctl as opus_ctl  # type: ignore
+            from opuslib.api import encoder as opus_encoder_api  # type: ignore
+        except Exception as exc:  # pragma: no cover - runtime dependency
+            LOGGER.debug("Skipping OPUS tuning: %s", exc)
+            return
+
+        encoder = getattr(self, "_opus_encoder", None)
+        if encoder is None or not hasattr(encoder, "encoder_state"):
+            return
+
+        def set_encoder_ctl(request: object, value: int, *, fallback: Optional[int] = None) -> None:
+            request_name = getattr(request, "__name__", repr(request))
+            try:
+                opus_encoder_api.encoder_ctl(encoder.encoder_state, request, value)
+            except Exception as exc:  # pragma: no cover - runtime dependency
+                LOGGER.debug("OPUS encoder ctl %s=%r failed: %s", request_name, value, exc)
+                if fallback is not None and fallback != value:
+                    try:
+                        opus_encoder_api.encoder_ctl(encoder.encoder_state, request, fallback)
+                    except Exception as exc_fallback:  # pragma: no cover - runtime dependency
+                        LOGGER.debug("OPUS encoder ctl %s fallback %r failed: %s", request_name, fallback, exc_fallback)
+
+        voice_signal = getattr(opuslib, "SIGNAL_VOICE", 3001)
+        music_signal = getattr(opuslib, "SIGNAL_MUSIC", 3002)
+        set_encoder_ctl(opus_ctl.set_signal, music_signal, fallback=voice_signal)
+        target_bitrate = 80_000 if self._opus_application == "restricted_lowdelay" else 96_000
+        set_encoder_ctl(opus_ctl.set_bitrate, target_bitrate)
+        set_encoder_ctl(opus_ctl.set_vbr, 0)
+        set_encoder_ctl(opus_ctl.set_vbr_constraint, 0)
+        set_encoder_ctl(opus_ctl.set_inband_fec, 0)
+        set_encoder_ctl(opus_ctl.set_packet_loss_perc, 0)
+        set_encoder_ctl(opus_ctl.set_dtx, 0)
+        set_encoder_ctl(opus_ctl.set_complexity, 10)
+
+        bw_wide = getattr(opuslib, "BANDWIDTH_WIDEBAND", 1103)
+        bw_full = getattr(opuslib, "BANDWIDTH_FULLBAND", 1105)
+        bandwidth = bw_wide if self._opus_application == "restricted_lowdelay" else bw_full
+        set_encoder_ctl(opus_ctl.set_max_bandwidth, bandwidth, fallback=bw_wide)
+        set_encoder_ctl(opus_ctl.set_bandwidth, bandwidth, fallback=bw_wide)
 
     # ------------------------------------------------------------------
     # Connection lifecycle
