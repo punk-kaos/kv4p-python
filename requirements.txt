@@ -1,0 +1,4 @@
+numpy>=1.24
+pyserial>=3.5
+sounddevice>=0.4.6
+opuslib>=3.0
